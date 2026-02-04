@@ -59,6 +59,11 @@ impl BlobParams {
         2.0_f32.powf(self.shift_semitones / 12.0)
     }
 
+    /// Get the time stretch ratio
+    pub fn stretch_ratio(&self) -> f32 {
+        self.stretch_ratio
+    }
+
     /// Get the number of samples in this blob
     pub fn num_samples(&self) -> i64 {
         self.end_sample - self.start_sample
