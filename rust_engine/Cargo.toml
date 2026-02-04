@@ -1,3 +1,4 @@
+
 [package]
 name = "openvocal_engine"
 version = "0.1.0"
@@ -18,6 +19,7 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 rubato = "0.14"  # High-quality resampling for pitch shifting
 realfft = "3.3"  # FFT for spectral processing
+num-complex = "0.4" # For complex number operations in FFT
 
 [profile.release]
 lto = true
