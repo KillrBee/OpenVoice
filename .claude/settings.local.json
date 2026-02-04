@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "WebFetch(domain:www.soundonsound.com)",
+      "WebFetch(domain:www.sweetwater.com)"
+    ]
+  }
+}
