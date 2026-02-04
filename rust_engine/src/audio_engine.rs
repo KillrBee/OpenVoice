@@ -24,7 +24,7 @@ enum AudioCommand {
 }
 
 /// Audio engine managing real-time playback with pitch/time manipulation
-#[pyclass]
+#[pyclass(unsendable)]
 pub struct AudioEngine {
     // Audio data (shared with audio thread)
     audio_data: Arc<RwLock<Vec<f32>>>,
