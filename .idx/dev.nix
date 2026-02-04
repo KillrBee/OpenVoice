@@ -7,7 +7,6 @@
   # Use https://search.nixos.org/packages to find packages
   packages = [
     pkgs.python311
-    pkgs.python311Packages.pip
     pkgs.rustup
     pkgs.pkg-config
     # Required for cpal (audio) on Linux
