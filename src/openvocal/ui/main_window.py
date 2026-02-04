@@ -3,49 +3,86 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QSplitter,
     QFileDialog,
     QMessageBox,
     QStatusBar,
     QProgressDialog,
-    QApplication,
 )
 from PyQt6.QtGui import QAction, QKeySequence, QDragEnterEvent, QDropEvent, QCloseEvent
 
 from openvocal.models.project import Project
+from openvocal.models.note_blob import NoteBlob
 from openvocal.ui.widgets.pitch_canvas import PitchCanvas
 from openvocal.ui.widgets.piano_roll import PianoRoll
 from openvocal.ui.widgets.transport import TransportBar
 from openvocal.ui.widgets.toolbar import EditorToolbar
+from openvocal.utils.audio_io import save_audio
+
+
+class AnalysisWorker(QObject):
+    """Performs audio analysis in a separate thread."""
+
+    finished = pyqtSignal(list)
+    progress = pyqtSignal(str, float)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: Path, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.path = path
+        self._is_interrupted = False
+
+    def run(self) -> None:
+        """Load audio file and run segmentation analysis."""
+        from openvocal.utils.audio_io import load_audio
+        from openvocal.analysis.segmenter import Segmenter
+
+        try:
+            # 1. Load audio
+            self.progress.emit("load", 0)
+            audio_data, sample_rate = load_audio(self.path)
+            if self._is_interrupted:
+                return
+
+            # 2. Run segmentation
+            segmenter = Segmenter(use_simple_pitch=True)
+
+            def update_progress(stage: str, value: float):
+                if self._is_interrupted:
+                    raise InterruptedError("Analysis canceled")
+                self.progress.emit(stage, value)
+
+            blobs = segmenter.segment(audio_data, sample_rate, update_progress)
+            if self._is_interrupted:
+                return
+
+            # Attach audio data to the first blob for project creation
+            if blobs:
+                blobs[0].__dict__["_temp_audio_data"] = audio_data
+                blobs[0].__dict__["_temp_sample_rate"] = sample_rate
+
+            self.finished.emit(blobs)
+
+        except InterruptedError:
+            self.error.emit("Analysis canceled by user.")
+        except Exception as e:
+            self.error.emit(f"Failed to analyze audio:\n{e}")
+
+    def stop(self) -> None:
+        """Signal the worker to stop."""
+        self._is_interrupted = True
 
 
 class MainWindow(QMainWindow):
     """
     Main application window containing the pitch editor.
-
-    Layout:
-    ┌─────────────────────────────────────────────┐
-    │  Menu Bar                                    │
-    ├─────────────────────────────────────────────┤
-    │  Toolbar                                     │
-    ├─────┬───────────────────────────────────────┤
-    │     │                                        │
-    │Piano│        Pitch Canvas                    │
-    │Roll │        (Blob Editor)                   │
-    │     │                                        │
-    ├─────┴───────────────────────────────────────┤
-    │  Transport Bar                               │
-    ├─────────────────────────────────────────────┤
-    │  Status Bar                                  │
-    └─────────────────────────────────────────────┘
     """
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -53,7 +90,9 @@ class MainWindow(QMainWindow):
 
         self.project = Project()
         self._audio_engine = None
-        self._is_analyzing = False
+        self._analysis_thread: Optional[QThread] = None
+        self._analysis_worker: Optional[AnalysisWorker] = None
+        self._progress_dialog: Optional[QProgressDialog] = None
 
         self._setup_ui()
         self._setup_menu()
@@ -86,7 +125,6 @@ class MainWindow(QMainWindow):
         self.pitch_canvas = PitchCanvas(self)
         editor_splitter.addWidget(self.pitch_canvas)
 
-        # Don't allow piano roll to be collapsed
         editor_splitter.setCollapsible(0, False)
         editor_splitter.setStretchFactor(0, 0)
         editor_splitter.setStretchFactor(1, 1)
@@ -102,28 +140,22 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
-        # Connect signals
         self._connect_signals()
 
     def _connect_signals(self) -> None:
         """Connect widget signals to slots."""
-        # Transport controls
         self.transport.play_clicked.connect(self._on_play)
         self.transport.stop_clicked.connect(self._on_stop)
         self.transport.loop_toggled.connect(self._on_loop_toggle)
 
-        # Piano roll and canvas coordination
         self.piano_roll.midi_range_changed.connect(self.pitch_canvas.set_midi_range)
         self.pitch_canvas.view_changed.connect(self.piano_roll.update_view)
 
-        # Blob selection and modification
         self.pitch_canvas.blob_selected.connect(self._on_blob_selected)
         self.pitch_canvas.blob_modified.connect(self._on_blob_modified)
 
-        # Canvas status messages
         self.pitch_canvas.status_message.connect(self._on_status_message)
 
-        # Toolbar actions
         self.toolbar.tool_changed.connect(self.pitch_canvas.set_tool)
         self.toolbar.snap_mode_changed.connect(self.pitch_canvas.set_snap_mode)
         self.toolbar.scale_changed.connect(self.pitch_canvas.set_scale)
@@ -133,78 +165,59 @@ class MainWindow(QMainWindow):
         """Set up the menu bar."""
         menubar = self.menuBar()
 
-        # File menu
         file_menu = menubar.addMenu("&File")
-
         open_action = QAction("&Open...", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self._on_open)
         file_menu.addAction(open_action)
-
         file_menu.addSeparator()
-
         export_action = QAction("&Export...", self)
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self._on_export)
         file_menu.addAction(export_action)
-
         file_menu.addSeparator()
-
         quit_action = QAction("&Quit", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
-        # Edit menu
         edit_menu = menubar.addMenu("&Edit")
-
         undo_action = QAction("&Undo", self)
         undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         undo_action.triggered.connect(self._on_undo)
         edit_menu.addAction(undo_action)
-
         redo_action = QAction("&Redo", self)
         redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         redo_action.triggered.connect(self._on_redo)
         edit_menu.addAction(redo_action)
-
         edit_menu.addSeparator()
-
         select_all_action = QAction("Select &All", self)
         select_all_action.setShortcut(QKeySequence.StandardKey.SelectAll)
         select_all_action.triggered.connect(self._on_select_all)
         edit_menu.addAction(select_all_action)
 
-        # View menu
         view_menu = menubar.addMenu("&View")
-
         zoom_in_action = QAction("Zoom &In", self)
         zoom_in_action.setShortcut(QKeySequence.StandardKey.ZoomIn)
         zoom_in_action.triggered.connect(self.pitch_canvas.zoom_in)
         view_menu.addAction(zoom_in_action)
-
         zoom_out_action = QAction("Zoom &Out", self)
         zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
         zoom_out_action.triggered.connect(self.pitch_canvas.zoom_out)
         view_menu.addAction(zoom_out_action)
-
         zoom_fit_action = QAction("Zoom to &Fit", self)
         zoom_fit_action.setShortcut(QKeySequence("Ctrl+0"))
         zoom_fit_action.triggered.connect(self.pitch_canvas.zoom_fit)
         view_menu.addAction(zoom_fit_action)
 
-        # Help menu
         help_menu = menubar.addMenu("&Help")
-
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
 
     def _setup_shortcuts(self) -> None:
         """Set up global keyboard shortcuts."""
-        # Spacebar for play/stop toggle
         from PyQt6.QtGui import QShortcut
-
         play_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         play_shortcut.activated.connect(self._toggle_playback)
 
@@ -218,7 +231,6 @@ class MainWindow(QMainWindow):
         """Initialize the Rust audio engine."""
         if self._audio_engine is not None:
             return True
-
         try:
             from openvocal_engine import AudioEngine
             self._audio_engine = AudioEngine()
@@ -226,142 +238,168 @@ class MainWindow(QMainWindow):
             return True
         except ImportError:
             QMessageBox.warning(
-                self,
-                "Audio Engine Not Available",
+                self, "Audio Engine Not Available",
                 "The Rust audio engine is not installed.\n"
                 "Build it with: cd rust_engine && maturin develop\n\n"
-                "Playback will not be available.",
+                "Playback and export will not be available.",
             )
             return False
         except Exception as e:
-            QMessageBox.warning(
-                self,
-                "Audio Engine Error",
-                f"Failed to initialize audio engine:\n{e}",
-            )
+            QMessageBox.warning(self, "Audio Engine Error", f"Failed to initialize audio engine:\n{e}")
             return False
 
     def load_audio(self, path: Path) -> None:
-        """Load an audio file and analyze it."""
-        from openvocal.utils.audio_io import load_audio
-        from openvocal.analysis.segmenter import Segmenter
+        """Load an audio file and analyze it using a background thread."""
+        if self._analysis_thread and self._analysis_thread.isRunning():
+            QMessageBox.warning(self, "Busy", "Already analyzing an audio file.")
+            return
 
-        self._is_analyzing = True
         self.status_bar.showMessage(f"Loading {path.name}...")
+        self._analysis_thread = QThread()
+        self._analysis_worker = AnalysisWorker(path)
+        self._analysis_worker.moveToThread(self._analysis_thread)
 
-        try:
-            # Load audio
-            audio_data, sample_rate = load_audio(path)
+        self._progress_dialog = QProgressDialog("Analyzing audio...", "Cancel", 0, 100, self)
+        self._progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dialog.setMinimumDuration(500)
+        self._progress_dialog.canceled.connect(self._cancel_analysis)
 
-            # Update project
-            self.project.audio_path = path
-            self.project.audio_data = audio_data
-            self.project.sample_rate = sample_rate
-            self.project.name = path.stem
-            self.project.blobs.clear()
+        self._analysis_worker.finished.connect(self._on_analysis_finished)
+        self._analysis_worker.progress.connect(self._on_analysis_progress)
+        self._analysis_worker.error.connect(self._on_analysis_error)
+        self._analysis_thread.started.connect(self._analysis_worker.run)
+        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
+        self._analysis_thread.start()
 
-            # Initialize audio engine with data
-            if self._init_audio_engine():
-                import numpy as np
-                self._audio_engine.load_audio(audio_data, sample_rate)
+    def _cancel_analysis(self) -> None:
+        """Handle cancellation of the analysis task."""
+        if self._analysis_worker:
+            self._analysis_worker.stop()
+        if self._analysis_thread and self._analysis_thread.isRunning():
+            self._analysis_thread.quit()
+            self._analysis_thread.wait()
+        self.status_bar.showMessage("Analysis canceled")
 
-            # Create progress dialog for analysis
-            progress = QProgressDialog("Analyzing audio...", "Cancel", 0, 100, self)
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(500)
+    def _on_analysis_progress(self, stage: str, value: float) -> None:
+        """Update analysis progress dialog."""
+        if not self._progress_dialog:
+            return
+        stages = {"load": 0, "pitch": 10, "onset": 50, "segment": 80}
+        base = stages.get(stage, 0)
+        total_progress = int(base + value * (stages.get(stage, 100) / 100.0 * 90))
+        if stage == "load":
+            self._progress_dialog.setLabelText("Loading audio file...")
+            self._progress_dialog.setValue(5)
+        else:
+            self._progress_dialog.setLabelText(f"Analyzing: {stage}...")
+            self._progress_dialog.setValue(total_progress)
 
-            def update_progress(stage: str, value: float):
-                if progress.wasCanceled():
-                    raise InterruptedError("Analysis canceled")
-                stages = {"pitch": 0, "onset": 33, "segment": 66}
-                base = stages.get(stage, 0)
-                progress.setValue(int(base + value * 33))
-                progress.setLabelText(f"Analyzing: {stage}...")
-                QApplication.processEvents()
+    def _on_analysis_error(self, message: str) -> None:
+        """Handle errors from the analysis thread."""
+        if self._progress_dialog:
+            self._progress_dialog.close()
+        QMessageBox.critical(self, "Error Analyzing File", message)
+        self.status_bar.showMessage("Error analyzing file")
+        self._cleanup_analysis_thread()
 
-            # Run segmentation
-            segmenter = Segmenter(use_simple_pitch=True)  # Use simple for faster MVP
-            blobs = segmenter.segment(audio_data, sample_rate, update_progress)
+    def _on_analysis_finished(self, blobs: List[NoteBlob]) -> None:
+        """Handle successful completion of the analysis."""
+        if self._progress_dialog:
+            self._progress_dialog.setValue(100)
+            self._progress_dialog.close()
 
-            # Add blobs to project
-            for blob in blobs:
-                self.project.add_blob(blob)
+        if not blobs:
+            self.status_bar.showMessage("No notes detected in audio file.")
+            return
 
-            progress.close()
+        audio_data = getattr(blobs[0], "_temp_audio_data", None)
+        sample_rate = getattr(blobs[0], "_temp_sample_rate", None)
+        path = self._analysis_worker.path
 
-            # Update UI
-            self.pitch_canvas.set_project(self.project)
-            self.transport.set_duration(self.project.duration)
-            self.setWindowTitle(f"OpenVocal - {self.project.name}")
-            self.status_bar.showMessage(
-                f"Loaded {path.name} ({len(blobs)} notes detected)"
-            )
+        if audio_data is None or sample_rate is None:
+            self.status_bar.showMessage("Internal error: audio data not passed from worker.")
+            return
 
-            # Send blob params to engine
-            if self._audio_engine:
-                try:
-                    from openvocal_engine import BlobParams
-                    engine_blobs = [
-                        BlobParams(
-                            b.id, b.start_sample, b.end_sample,
-                            b.shift_semitones, b.stretch_ratio
-                        )
-                        for b in self.project.blobs
-                    ]
-                    self._audio_engine.set_blobs(engine_blobs)
-                except ImportError:
-                    pass  # Engine not available
+        self.project.audio_path = path
+        self.project.audio_data = audio_data
+        self.project.sample_rate = sample_rate
+        self.project.name = path.stem
+        self.project.blobs.clear()
+        for blob in blobs:
+            self.project.add_blob(blob)
 
-        except InterruptedError:
-            self.status_bar.showMessage("Analysis canceled")
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error Loading File",
-                f"Failed to load audio file:\n{e}",
-            )
-            self.status_bar.showMessage("Error loading file")
-        finally:
-            self._is_analyzing = False
+        if self._init_audio_engine():
+            self._audio_engine.load_audio(audio_data, sample_rate)
 
-    # === Slots ===
+        self.pitch_canvas.set_project(self.project)
+        self.transport.set_duration(self.project.duration)
+        self.setWindowTitle(f"OpenVocal - {self.project.name}")
+        self.status_bar.showMessage(f"Loaded {path.name} ({len(blobs)} notes detected)")
+
+        if self._audio_engine:
+            try:
+                from openvocal_engine import BlobParams
+                engine_blobs = [
+                    BlobParams(b.id, b.start_sample, b.end_sample, b.shift_semitones, b.stretch_ratio)
+                    for b in self.project.blobs
+                ]
+                self._audio_engine.set_blobs(engine_blobs)
+            except ImportError:
+                pass
+
+        self._cleanup_analysis_thread()
+
+    def _cleanup_analysis_thread(self) -> None:
+        """Clean up analysis thread and worker."""
+        self._analysis_thread = None
+        self._analysis_worker = None
+        self._progress_dialog = None
 
     def _on_open(self) -> None:
         """Handle File > Open."""
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Audio File",
-            "",
-            "Audio Files (*.wav *.flac *.mp3 *.ogg);;All Files (*)",
+            self, "Open Audio File", "", "Audio Files (*.wav *.flac *.mp3 *.ogg);;All Files (*)",
         )
         if path:
             self.load_audio(Path(path))
 
     def _on_export(self) -> None:
         """Handle File > Export."""
-        if not self.project.has_audio:
-            QMessageBox.information(self, "Export", "No audio loaded to export.")
+        if not self.project.has_audio or not self._audio_engine:
+            QMessageBox.information(self, "Export", "No audio loaded or engine available to export.")
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Audio",
-            f"{self.project.name}_edited.wav",
-            "WAV Files (*.wav);;FLAC Files (*.flac)",
+            self, "Export Audio", f"{self.project.name}_edited.wav", "WAV Files (*.wav);;FLAC Files (*.flac)",
         )
-        if path:
-            # TODO: Implement export with applied pitch/time changes
-            self.status_bar.showMessage(f"Exported to {path}")
+        if not path:
+            return
+
+        self.status_bar.showMessage("Exporting audio...")
+
+        try:
+            from openvocal_engine import BlobParams
+            engine_blobs = [
+                BlobParams(b.id, b.start_sample, b.end_sample, b.shift_semitones, b.stretch_ratio)
+                for b in self.project.blobs
+            ]
+
+            processed_audio = self._audio_engine.process_offline(engine_blobs)
+
+            save_audio(Path(path), processed_audio, self.project.sample_rate)
+
+            self.status_bar.showMessage(f"Exported successfully to {Path(path).name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export audio:\n{e}")
+            self.status_bar.showMessage("Export failed")
 
     def _on_undo(self) -> None:
         """Handle Edit > Undo."""
-        # TODO: Implement undo stack
-        pass
+        pass  # TODO: Implement undo stack
 
     def _on_redo(self) -> None:
         """Handle Edit > Redo."""
-        # TODO: Implement redo
-        pass
+        pass  # TODO: Implement redo
 
     def _on_select_all(self) -> None:
         """Handle Edit > Select All."""
@@ -372,8 +410,7 @@ class MainWindow(QMainWindow):
     def _on_about(self) -> None:
         """Show about dialog."""
         QMessageBox.about(
-            self,
-            "About OpenVocal",
+            self, "About OpenVocal",
             "<h2>OpenVocal</h2>"
             "<p>Version 0.1.0</p>"
             "<p>Open-source vocal pitch correction with visual blob editing.</p>"
@@ -405,19 +442,15 @@ class MainWindow(QMainWindow):
         """Handle loop toggle."""
         if self._audio_engine:
             if enabled and self.project.loop_enabled:
-                self._audio_engine.set_loop(
-                    self.project.loop_start, self.project.loop_end
-                )
+                self._audio_engine.set_loop(self.project.loop_start, self.project.loop_end)
             else:
                 self._audio_engine.set_loop(None, None)
 
     def _on_blob_selected(self, blob_id: int) -> None:
         """Handle blob selection."""
         self.project.select_blob(blob_id)
-        # Update toolbar info with selected note
         blob = self.project.get_blob_by_id(blob_id)
         if blob:
-            from openvocal.models.note_blob import NoteBlob
             note_name = NoteBlob.midi_to_note_name(int(blob.shifted_midi))
             self.toolbar.set_info(f"Selected: {note_name}")
 
@@ -442,7 +475,7 @@ class MainWindow(QMainWindow):
                 )
                 self._audio_engine.update_blob(params)
             except ImportError:
-                pass  # Engine not available
+                pass
 
     def _update_playback_position(self) -> None:
         """Update UI with current playback position."""
@@ -451,13 +484,9 @@ class MainWindow(QMainWindow):
             time = pos / self.project.sample_rate if self.project.sample_rate > 0 else 0
             self.transport.set_position(time)
             self.pitch_canvas.set_playhead_position(time)
-
-            # Check if playback ended
             if not self._audio_engine.is_playing():
                 self._playback_timer.stop()
                 self.transport.set_playing(False)
-
-    # === Drag and Drop ===
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """Accept audio file drops."""
@@ -481,10 +510,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Handle window close."""
+        if self._analysis_thread and self._analysis_thread.isRunning():
+            self._cancel_analysis()
+
         if self.project.is_modified:
             reply = QMessageBox.question(
-                self,
-                "Unsaved Changes",
+                self, "Unsaved Changes",
                 "You have unsaved changes. Are you sure you want to quit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -493,7 +524,6 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # Stop playback and clean up
         if self._audio_engine:
             self._audio_engine.stop()
         event.accept()

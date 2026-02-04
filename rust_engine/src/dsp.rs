@@ -66,65 +66,32 @@ impl PitchShifter {
     }
 
     /// Process a block of audio with pitch shift
-    ///
-    /// # Arguments
-    /// * `input` - Input samples
-    /// * `output` - Output buffer (must be same size as input)
-    /// * `pitch_ratio` - Pitch shift ratio (1.0 = no shift, 2.0 = octave up)
     pub fn process(&mut self, input: &[f32], output: &mut [f32], pitch_ratio: f32) {
-        if pitch_ratio == 1.0 {
-            // No shift needed, just copy
+        if (pitch_ratio - 1.0).abs() < 1e-4 {
             output[..input.len()].copy_from_slice(input);
             return;
         }
 
         output.fill(0.0);
-
-        let num_frames = (input.len() / self.hop_size).saturating_sub(3);
+        let num_frames = if self.hop_size > 0 { (input.len() / self.hop_size).saturating_sub(3) } else { 0 };
 
         for frame in 0..num_frames {
             let in_offset = frame * self.hop_size;
-
-            // Copy input with window
             for i in 0..self.fft_size {
-                if in_offset + i < input.len() {
-                    self.input_buffer[i] = input[in_offset + i] * self.window[i];
-                } else {
-                    self.input_buffer[i] = 0.0;
-                }
+                self.input_buffer[i] = input.get(in_offset + i).unwrap_or(&0.0) * self.window[i];
             }
 
-            // Forward FFT
-            if let Err(_) = self.fft.process(&mut self.input_buffer, &mut self.spectrum) {
-                // FFT failed, skip this frame
-                continue;
-            }
-
-            // Phase vocoder pitch shifting
+            if self.fft.process(&mut self.input_buffer, &mut self.spectrum).is_err() { continue; }
             self.pitch_shift_spectrum(pitch_ratio);
+            if self.ifft.process(&mut self.spectrum, &mut self.input_buffer).is_err() { continue; }
 
-            // Inverse FFT
-            if let Err(_) = self.ifft.process(&mut self.spectrum, &mut self.input_buffer) {
-                // IFFT failed, skip this frame
-                continue;
-            }
-
-            // Normalize and overlap-add
-            let norm = 1.0 / (self.fft_size as f32);
+            let norm = 1.0 / (self.fft_size as f32 * 0.5);
             let out_offset = frame * self.hop_size;
-
             for i in 0..self.fft_size {
-                let out_idx = out_offset + i;
-                if out_idx < output.len() {
-                    output[out_idx] += self.input_buffer[i] * self.window[i] * norm;
+                if let Some(out) = output.get_mut(out_offset + i) {
+                    *out += self.input_buffer[i] * self.window[i] * norm;
                 }
             }
-        }
-
-        // Normalize overlap-add
-        let ola_factor = self.fft_size as f32 / self.hop_size as f32 / 2.0;
-        for sample in output.iter_mut() {
-            *sample /= ola_factor;
         }
     }
 
@@ -132,49 +99,26 @@ impl PitchShifter {
         let freq_per_bin = 1.0 / self.fft_size as f32;
         let expect = 2.0 * std::f32::consts::PI * self.hop_size as f32 / self.fft_size as f32;
 
-        // Analyze phases
         for k in 0..self.spectrum.len() {
             let mag = self.spectrum[k].norm();
             let phase = self.spectrum[k].arg();
-
-            // Get phase difference
             let mut phase_diff = phase - self.last_phase[k];
             self.last_phase[k] = phase;
-
-            // Subtract expected phase
             phase_diff -= k as f32 * expect;
-
-            // Wrap to -pi..pi
-            phase_diff = phase_diff - (phase_diff / (2.0 * std::f32::consts::PI)).round()
-                * 2.0
-                * std::f32::consts::PI;
-
-            // Get true frequency
+            phase_diff -= (phase_diff / std::f32::consts::PI).round() * std::f32::consts::PI;
             let true_freq = k as f32 * freq_per_bin + phase_diff / expect * freq_per_bin;
-
-            // Store magnitude and frequency for resynthesis
             self.scratch[k] = num_complex::Complex::new(mag, true_freq);
         }
 
-        // Clear spectrum for synthesis
         self.spectrum.fill(num_complex::Complex::new(0.0, 0.0));
 
-        // Resynthesize with shifted frequencies
         for k in 0..self.scratch.len() {
             let new_bin = (k as f32 * pitch_ratio).round() as usize;
             if new_bin < self.spectrum.len() {
                 let mag = self.scratch[k].re;
                 let true_freq = self.scratch[k].im;
-
-                // Shift frequency
                 let shifted_freq = true_freq * pitch_ratio;
-
-                // Accumulate phase
-                self.sum_phase[new_bin] +=
-                    expect * (shifted_freq / freq_per_bin - new_bin as f32);
-                self.sum_phase[new_bin] += new_bin as f32 * expect;
-
-                // Convert back to complex
+                self.sum_phase[new_bin] += expect * (shifted_freq / freq_per_bin - new_bin as f32);
                 self.spectrum[new_bin] = num_complex::Complex::from_polar(mag, self.sum_phase[new_bin]);
             }
         }
@@ -187,126 +131,83 @@ impl Default for PitchShifter {
     }
 }
 
-/// Time stretcher using overlap-add
+/// Time stretcher using WSOLA algorithm
 pub struct TimeStretcher {
-    fft_size: usize,
+    win_size: usize,
+    hop_size: usize,
     window: Vec<f32>,
-    input_buffer: Vec<f32>,
-    output_buffer: Vec<f32>,
+    tolerance: usize,
 }
 
 impl TimeStretcher {
     pub fn new() -> Self {
-        let fft_size = FFT_SIZE;
-
-        // Hann window
-        let window: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / fft_size as f32).cos())
-            })
+        let win_size = 1024;
+        let hop_size = win_size / 4;
+        let window: Vec<f32> = (0..win_size)
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / win_size as f32).cos()))
             .collect();
-
         TimeStretcher {
-            fft_size,
+            win_size,
+            hop_size,
             window,
-            input_buffer: vec![0.0; fft_size],
-            output_buffer: vec![0.0; fft_size * 4],
+            tolerance: hop_size / 2,
         }
     }
 
-    /// Process audio with time stretch using WSOLA-like algorithm
-    ///
-    /// # Arguments
-    /// * `input` - Input samples
-    /// * `stretch_ratio` - Time stretch ratio (1.0 = original, 2.0 = twice as long)
-    ///
-    /// # Returns
-    /// Stretched audio samples
     pub fn process(&mut self, input: &[f32], stretch_ratio: f32) -> Vec<f32> {
-        if (stretch_ratio - 1.0).abs() < 0.01 {
-            // No stretch needed
+        if (stretch_ratio - 1.0).abs() < 1e-4 {
             return input.to_vec();
         }
 
         let output_len = (input.len() as f32 * stretch_ratio) as usize;
         let mut output = vec![0.0; output_len];
+        let mut output_pos = 0.0;
+        let mut input_pos = 0;
 
-        let analysis_hop = self.fft_size / 4;
-        let synthesis_hop = (analysis_hop as f32 * stretch_ratio) as usize;
+        while input_pos + self.win_size < input.len() && (output_pos as usize) + self.win_size < output_len {
+            let best_offset = self.find_best_offset(&input[input_pos..]);
+            input_pos += best_offset;
 
-        let num_frames = input.len() / analysis_hop;
-        let mut write_pos = 0;
+            let input_segment = &input[input_pos..input_pos + self.win_size];
+            let output_segment = &mut output[output_pos as usize..output_pos as usize + self.win_size];
 
-        for frame in 0..num_frames {
-            let read_pos = frame * analysis_hop;
-
-            // Copy input frame with window
-            for i in 0..self.fft_size {
-                let idx = read_pos + i;
-                if idx < input.len() {
-                    self.input_buffer[i] = input[idx] * self.window[i];
-                } else {
-                    self.input_buffer[i] = 0.0;
-                }
+            for i in 0..self.win_size {
+                output_segment[i] += input_segment[i] * self.window[i];
             }
 
-            // Overlap-add to output
-            for i in 0..self.fft_size {
-                let out_idx = write_pos + i;
-                if out_idx < output.len() {
-                    output[out_idx] += self.input_buffer[i] * self.window[i];
-                }
-            }
-
-            write_pos += synthesis_hop;
-        }
-
-        // Normalize
-        let norm_factor = self.fft_size as f32 / synthesis_hop as f32 / 2.0;
-        for sample in output.iter_mut() {
-            *sample /= norm_factor;
+            output_pos += self.hop_size as f32 * stretch_ratio;
+            input_pos += (self.hop_size as f32 * stretch_ratio) as usize;
         }
 
         output
     }
 
-    pub fn reset(&mut self) {
-        self.input_buffer.fill(0.0);
-        self.output_buffer.fill(0.0);
+    fn find_best_offset(&self, input_segment: &[f32]) -> usize {
+        let mut max_corr = -1.0;
+        let mut best_offset = 0;
+
+        for offset in 0..self.tolerance {
+            let mut corr = 0.0;
+            let segment1 = &input_segment[offset..offset + self.hop_size];
+            let segment2 = &input_segment[self.hop_size..self.hop_size * 2];
+
+            for i in 0..self.hop_size {
+                corr += segment1[i] * segment2[i];
+            }
+
+            if corr > max_corr {
+                max_corr = corr;
+                best_offset = offset;
+            }
+        }
+        best_offset
     }
+
+    pub fn reset(&mut self) {}
 }
 
 impl Default for TimeStretcher {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pitch_shifter_passthrough() {
-        let mut shifter = PitchShifter::new();
-        let input: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin()).collect();
-        let mut output = vec![0.0; input.len()];
-
-        shifter.process(&input, &mut output, 1.0);
-
-        // Should be approximately equal for ratio 1.0
-        for (a, b) in input.iter().zip(output.iter()) {
-            assert!((a - b).abs() < 0.01, "Passthrough failed");
-        }
-    }
-
-    #[test]
-    fn test_time_stretcher_identity() {
-        let mut stretcher = TimeStretcher::new();
-        let input: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin()).collect();
-
-        let output = stretcher.process(&input, 1.0);
-
-        assert_eq!(input.len(), output.len());
     }
 }

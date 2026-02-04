@@ -3,7 +3,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -268,6 +268,61 @@ impl AudioEngine {
         self.is_playing.load(Ordering::SeqCst)
     }
 
+    /// Process the entire audio file offline with current blob settings
+    /// and return the result.
+    pub fn process_offline(
+        &self,
+        py: Python,
+        blobs: Vec<BlobParams>,
+    ) -> PyResult<Py<PyArray1<f32>>> {
+        let audio_data = self.audio_data.read();
+        let mut output = audio_data.clone();
+
+        let mut pitch_shifter = PitchShifter::new();
+        let mut time_stretcher = TimeStretcher::new();
+
+        // TODO: This is a simplified offline render. A more robust solution
+        // would use a proper graph-based processor to handle overlaps.
+
+        for blob in blobs {
+            let start = blob.start_sample as usize;
+            let end = blob.end_sample as usize;
+            if start >= end || end > audio_data.len() {
+                continue;
+            }
+
+            let original_len = end - start;
+            let mut chunk = audio_data[start..end].to_vec();
+
+            // 1. Time Stretch
+            let stretch_ratio = blob.stretch_ratio();
+            if (stretch_ratio - 1.0).abs() > 0.01 {
+                chunk = time_stretcher.process(&chunk, stretch_ratio);
+            }
+
+            // 2. Pitch Shift
+            let pitch_ratio = blob.pitch_ratio();
+            if (pitch_ratio - 1.0).abs() > 0.01 {
+                let mut shifted_chunk = vec![0.0; chunk.len()];
+                pitch_shifter.process(&chunk, &mut shifted_chunk, pitch_ratio);
+                chunk = shifted_chunk;
+            }
+
+            // 3. Overlap-add into output buffer
+            // This simple version just replaces the segment, which can cause artifacts.
+            let new_len = chunk.len();
+            let new_end = start + new_len;
+            if new_end > output.len() {
+                output.resize(new_end, 0.0);
+            }
+            // Basic crossfade to reduce clicks
+            let fade_len = (self.sample_rate.load(Ordering::SeqCst) as f32 * 0.01) as usize;
+            self.crossfade_and_replace(&mut output, &chunk, start, fade_len);
+        }
+
+        Ok(output.into_pyarray(py).to_owned())
+    }
+
     /// Get list of available output devices
     #[staticmethod]
     pub fn get_output_devices() -> PyResult<Vec<String>> {
@@ -430,6 +485,34 @@ impl AudioEngine {
             })?;
 
         Ok(stream)
+    }
+
+    /// Overlap-add a chunk into the main buffer with crossfading
+    fn crossfade_and_replace(&self, buffer: &mut Vec<f32>, chunk: &[f32], position: usize, fade_len: usize) {
+        if position + chunk.len() > buffer.len() {
+            buffer.resize(position + chunk.len(), 0.0);
+        }
+
+        let safe_fade_len = fade_len.min(chunk.len() / 2).min(position);
+
+        // Fade in
+        for i in 0..safe_fade_len {
+            let gain = i as f32 / safe_fade_len as f32;
+            buffer[position + i] = buffer[position + i] * (1.0 - gain) + chunk[i] * gain;
+        }
+
+        // Copy main part
+        let main_part_start = position + safe_fade_len;
+        let chunk_main_part_end = chunk.len() - safe_fade_len;
+        buffer[main_part_start..position + chunk_main_part_end].copy_from_slice(&chunk[safe_fade_len..chunk_main_part_end]);
+
+        // Fade out
+        for i in 0..safe_fade_len {
+            let gain = i as f32 / safe_fade_len as f32;
+            let buf_idx = position + chunk.len() - safe_fade_len + i;
+            let chunk_idx = chunk.len() - safe_fade_len + i;
+            buffer[buf_idx] = buffer[buf_idx] * gain + chunk[chunk_idx] * (1.0 - gain);
+        }
     }
 }
 
