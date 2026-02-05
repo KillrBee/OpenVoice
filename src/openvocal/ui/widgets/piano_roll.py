@@ -219,29 +219,81 @@ class SineGenerator:
         self._phase = 0.0
         self._sample_rate = 44100
         self._amplitude = 0.3
+        self._sounddevice = None
 
         self._init_audio()
 
     def _init_audio(self) -> None:
-        """Initialize audio output."""
+        """Initialize audio output using sounddevice."""
         try:
-            # Try to use the Rust engine for audio
-            from openvocal_engine import AudioEngine
-            # For now, we'll skip actual implementation
-            # A real implementation would use a separate simple stream
-            pass
+            import sounddevice as sd
+            self._sounddevice = sd
         except ImportError:
-            pass
+            # sounddevice not available - audition won't work
+            self._sounddevice = None
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """Generate sine wave samples for the audio stream."""
+        import numpy as np
+
+        if not self._playing:
+            outdata.fill(0)
+            return
+
+        # Generate sine wave
+        t = (np.arange(frames) + self._phase) / self._sample_rate
+        samples = self._amplitude * np.sin(2 * np.pi * self._frequency * t)
+
+        # Apply simple envelope to reduce clicks
+        if frames > 100:
+            # Fade in first 50 samples
+            samples[:50] *= np.linspace(0, 1, 50)
+
+        outdata[:, 0] = samples.astype(np.float32)
+
+        # Update phase for continuity
+        self._phase += frames
 
     def play(self, frequency: float) -> None:
         """Start playing a frequency."""
+        if self._sounddevice is None:
+            return
+
         self._frequency = frequency
+        self._phase = 0.0
         self._playing = True
-        # Actual playback would be implemented here
+
+        # Stop any existing stream
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+
+        # Create new stream
+        try:
+            self._stream = self._sounddevice.OutputStream(
+                samplerate=self._sample_rate,
+                channels=1,
+                callback=self._audio_callback,
+                blocksize=512,
+            )
+            self._stream.start()
+        except Exception as e:
+            print(f"Failed to start audio stream: {e}")
+            self._playing = False
 
     def stop(self) -> None:
         """Stop playing."""
         self._playing = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
 
     def __del__(self):
         self.stop()

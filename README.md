@@ -71,6 +71,7 @@ python -m openvocal
 - **Move Pitch**: Drag a blob vertically (snaps to semitones)
 - **Fine Tune**: Hold Alt while dragging for cent-level precision
 - **Time Stretch**: Drag the edges of a blob to stretch/compress
+- **Piano Roll**: Click keys on the left sidebar to audition pitches
 
 ### Navigation
 
