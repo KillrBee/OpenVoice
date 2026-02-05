@@ -5,8 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, List
 
+import numpy as np
+
 from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QVBoxLayout,
@@ -365,8 +368,8 @@ class MainWindow(QMainWindow):
 
     def _on_export(self) -> None:
         """Handle File > Export."""
-        if not self.project.has_audio or not self._audio_engine:
-            QMessageBox.information(self, "Export", "No audio loaded or engine available to export.")
+        if not self.project.has_audio:
+            QMessageBox.information(self, "Export", "No audio loaded to export.")
             return
 
         path, _ = QFileDialog.getSaveFileName(
@@ -375,23 +378,160 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        # Show progress dialog
+        progress = QProgressDialog("Exporting audio...", "Cancel", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
         self.status_bar.showMessage("Exporting audio...")
 
         try:
-            from openvocal_engine import BlobParams
-            engine_blobs = [
-                BlobParams(b.id, b.start_sample, b.end_sample, b.shift_semitones, b.stretch_ratio)
-                for b in self.project.blobs
-            ]
+            processed_audio = self._process_audio_for_export(progress)
+            if processed_audio is None:
+                # Export was cancelled or failed
+                return
 
-            processed_audio = self._audio_engine.process_offline(engine_blobs)
+            progress.setLabelText("Writing file...")
+            QApplication.processEvents()
 
             save_audio(Path(path), processed_audio, self.project.sample_rate)
 
+            progress.close()
             self.status_bar.showMessage(f"Exported successfully to {Path(path).name}")
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Audio exported successfully to:\n{Path(path).name}"
+            )
         except Exception as e:
+            progress.close()
             QMessageBox.critical(self, "Export Error", f"Failed to export audio:\n{e}")
             self.status_bar.showMessage("Export failed")
+
+    def _process_audio_for_export(self, progress: QProgressDialog) -> Optional[np.ndarray]:
+        """
+        Process audio with pitch/time modifications for export.
+
+        Uses Rust engine if available, otherwise falls back to pure Python.
+        """
+        # Try Rust engine first (faster, better quality)
+        if self._audio_engine:
+            try:
+                from openvocal_engine import BlobParams
+                engine_blobs = [
+                    BlobParams(b.id, b.start_sample, b.end_sample, b.shift_semitones, b.stretch_ratio)
+                    for b in self.project.blobs
+                ]
+                progress.setLabelText("Processing audio (Rust engine)...")
+                QApplication.processEvents()
+                return self._audio_engine.process_offline(engine_blobs)
+            except Exception as e:
+                # Fall through to Python fallback
+                print(f"Rust engine export failed, using Python fallback: {e}")
+
+        # Pure Python fallback
+        progress.setLabelText("Processing audio (Python fallback)...")
+        QApplication.processEvents()
+        return self._process_audio_python_fallback(progress)
+
+    def _process_audio_python_fallback(self, progress: QProgressDialog) -> Optional[np.ndarray]:
+        """
+        Pure Python audio processing fallback when Rust engine unavailable.
+
+        This is slower and lower quality than the Rust engine but allows
+        basic export functionality without the native extension.
+        """
+        audio = self.project.audio_data.copy()
+        sample_rate = self.project.sample_rate
+        blobs = self.project.blobs
+
+        if not blobs:
+            return audio
+
+        # Simple pitch shifting using resampling (no formant preservation)
+        # This is a basic implementation - the Rust engine is preferred
+        progress.setMaximum(len(blobs))
+
+        for i, blob in enumerate(blobs):
+            if progress.wasCanceled():
+                self.status_bar.showMessage("Export cancelled")
+                return None
+
+            progress.setValue(i)
+            progress.setLabelText(f"Processing note {i + 1} of {len(blobs)}...")
+            QApplication.processEvents()
+
+            # Skip if no modifications
+            if abs(blob.shift_semitones) < 0.01 and abs(blob.stretch_ratio - 1.0) < 0.01:
+                continue
+
+            start = blob.start_sample
+            end = blob.end_sample
+            if start >= end or end > len(audio):
+                continue
+
+            chunk = audio[start:end].copy()
+
+            # Apply pitch shift via resampling (simple but causes duration change)
+            if abs(blob.shift_semitones) >= 0.01:
+                pitch_ratio = 2.0 ** (blob.shift_semitones / 12.0)
+                chunk = self._resample_chunk(chunk, pitch_ratio, sample_rate)
+
+            # Apply time stretch via resampling
+            if abs(blob.stretch_ratio - 1.0) >= 0.01:
+                chunk = self._resample_chunk(chunk, 1.0 / blob.stretch_ratio, sample_rate)
+
+            # Simple overlap-add back into output
+            new_len = len(chunk)
+            new_end = start + new_len
+
+            # Resize output if needed
+            if new_end > len(audio):
+                audio = np.pad(audio, (0, new_end - len(audio)), mode='constant')
+
+            # Crossfade to reduce clicks (10ms fade)
+            fade_samples = int(sample_rate * 0.01)
+            self._crossfade_insert(audio, chunk, start, fade_samples)
+
+        progress.setValue(len(blobs))
+        return audio
+
+    def _resample_chunk(self, chunk: np.ndarray, ratio: float, sample_rate: int) -> np.ndarray:
+        """Resample an audio chunk by the given ratio."""
+        if abs(ratio - 1.0) < 0.001:
+            return chunk
+
+        new_length = int(len(chunk) / ratio)
+        if new_length < 1:
+            return chunk
+
+        # Use linear interpolation for simplicity
+        indices = np.linspace(0, len(chunk) - 1, new_length)
+        return np.interp(indices, np.arange(len(chunk)), chunk).astype(np.float32)
+
+    def _crossfade_insert(
+        self, output: np.ndarray, chunk: np.ndarray, start: int, fade_len: int
+    ) -> None:
+        """Insert a chunk into output with crossfade to reduce clicks."""
+        end = start + len(chunk)
+        fade_len = min(fade_len, len(chunk) // 2, start, len(output) - end if end < len(output) else 0)
+
+        if fade_len > 0:
+            # Fade in
+            fade_in = np.linspace(0, 1, fade_len, dtype=np.float32)
+            chunk[:fade_len] *= fade_in
+            output[start:start + fade_len] *= (1 - fade_in)
+
+            # Fade out
+            fade_out = np.linspace(1, 0, fade_len, dtype=np.float32)
+            if end <= len(output):
+                chunk[-fade_len:] *= fade_out
+                output[end - fade_len:end] *= (1 - fade_out)
+
+        # Copy chunk to output
+        output[start:end] = output[start:end] + chunk[:end - start]
 
     def _on_undo(self) -> None:
         """Handle Edit > Undo."""

@@ -151,7 +151,7 @@ maturin develop --release  # Release build
 - [x] Onset detection (librosa)
 - [x] Rust audio engine with PyO3
 - [x] Real-time pitch shifting
-- [ ] Export edited audio
+- [x] Export edited audio (WAV/FLAC)
 - [ ] Formant preservation
 - [ ] Polyphonic support
 - [ ] Plugin format (VST/AU)
