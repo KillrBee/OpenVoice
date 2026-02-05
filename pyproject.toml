@@ -35,6 +35,7 @@ dependencies = [
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
     "resampy>=0.4.0",
+    "numba>=0.57.0",
 ]
 
 [project.optional-dependencies]
@@ -63,11 +64,11 @@ target-version = ["py310", "py311", "py312"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py311"
 select = ["E", "F", "W", "I", "UP", "B", "C4"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
