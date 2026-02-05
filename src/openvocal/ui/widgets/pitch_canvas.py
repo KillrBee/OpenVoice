@@ -514,10 +514,12 @@ class PitchCanvas(QGraphicsView):
         # Set initial scene rect
         self._scene.setSceneRect(0, 0, 10000, 2000)
 
-        # Playhead line
+        # Playhead line - bright white/cyan for visibility against dark background
         self._playhead = QGraphicsLineItem()
-        self._playhead.setPen(QPen(QColor(255, 100, 100), 2))
-        self._playhead.setZValue(1000)
+        playhead_pen = QPen(QColor(0, 255, 255), 2)  # Cyan color
+        playhead_pen.setCosmetic(True)  # Constant width regardless of zoom
+        self._playhead.setPen(playhead_pen)
+        self._playhead.setZValue(1000)  # Always on top
         self._scene.addItem(self._playhead)
         self._update_playhead()
 
@@ -648,12 +650,17 @@ class PitchCanvas(QGraphicsView):
         """Update playhead position."""
         self._playhead_position = time_seconds
         self._update_playhead()
+        # Force repaint of the viewport (needed with MinimalViewportUpdate mode)
+        self.viewport().update()
 
     def _update_playhead(self) -> None:
-        """Update playhead line geometry."""
+        """Update playhead line geometry to span the visible viewport."""
         x = self.view_transform.time_to_x(self._playhead_position)
-        scene_rect = self._scene.sceneRect()
-        self._playhead.setLine(x, scene_rect.top(), x, scene_rect.bottom())
+        # Use viewport-mapped coordinates for reliable visibility
+        viewport_rect = self.viewport().rect()
+        scene_top = self.mapToScene(0, 0).y()
+        scene_bottom = self.mapToScene(0, viewport_rect.height()).y()
+        self._playhead.setLine(x, scene_top, x, scene_bottom)
 
     def set_tool(self, tool: EditTool) -> None:
         """Set the current editing tool."""
