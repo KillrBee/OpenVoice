@@ -29,8 +29,8 @@ OpenVocal uses a three-layer architecture:
 
 ```bash
 # Clone the repository
-git clone https://github.com/openvocal/openvocal.git
-cd openvocal
+git clone https://github.com/KillrBee/OpenVocal.git
+cd OpenVocal
 
 # Create virtual environment
 python -m venv venv

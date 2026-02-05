@@ -34,6 +34,7 @@ dependencies = [
     "torchcrepe>=0.0.22",
     "librosa>=0.10.0",
     "soundfile>=0.12.0",
+    "sounddevice>=0.4.0",
     "resampy>=0.4.0",
     "numba>=0.57.0",
 ]
@@ -51,9 +52,9 @@ dev = [
 openvocal = "openvocal.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/openvocal/openvocal"
-Repository = "https://github.com/openvocal/openvocal"
-Issues = "https://github.com/openvocal/openvocal/issues"
+Homepage = "https://github.com/KillrBee/OpenVocal"
+Repository = "https://github.com/KillrBee/OpenVocal"
+Issues = "https://github.com/KillrBee/OpenVocal/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
