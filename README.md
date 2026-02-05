@@ -74,9 +74,13 @@ python -m openvocal
 
 ### Navigation
 
-- **Scroll**: Mouse wheel
-- **Zoom Time**: Ctrl + Mouse wheel
-- **Zoom Pitch**: Alt + Mouse wheel
+- **Vertical Scroll**: Mouse wheel
+- **Horizontal Scroll**: Shift + Mouse wheel
+- **Zoom Time (horizontal)**: Ctrl + Mouse wheel
+- **Zoom Pitch (vertical)**: Alt + Mouse wheel (or Ctrl+Shift + Mouse wheel)
+- **Zoom In/Out**: + / - keys (horizontal), Shift + +/- (vertical)
+- **Fit All Content**: Home or F key
+- **Fit Selection**: Ctrl + F
 
 ### Playback
 
