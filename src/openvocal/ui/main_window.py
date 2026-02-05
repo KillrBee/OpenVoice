@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self.transport.play_clicked.connect(self._on_play)
         self.transport.stop_clicked.connect(self._on_stop)
         self.transport.loop_toggled.connect(self._on_loop_toggle)
+        self.transport.position_changed.connect(self._on_position_changed)
 
         self.piano_roll.midi_range_changed.connect(self.pitch_canvas.set_midi_range)
         self.pitch_canvas.view_changed.connect(self.piano_roll.update_view)
@@ -585,6 +586,15 @@ class MainWindow(QMainWindow):
                 self._audio_engine.set_loop(self.project.loop_start, self.project.loop_end)
             else:
                 self._audio_engine.set_loop(None, None)
+
+    def _on_position_changed(self, time_seconds: float) -> None:
+        """Handle seek request from transport slider."""
+        if self._audio_engine and self.project.has_audio:
+            # Convert time to samples
+            position_samples = int(time_seconds * self.project.sample_rate)
+            self._audio_engine.seek(position_samples)
+            # Update the playhead in the canvas
+            self.pitch_canvas.set_playhead_position(time_seconds)
 
     def _on_blob_selected(self, blob_id: int) -> None:
         """Handle blob selection."""
