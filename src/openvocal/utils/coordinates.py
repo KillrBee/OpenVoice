@@ -5,8 +5,14 @@ import numpy as np
 
 # Default view parameters
 DEFAULT_PIXELS_PER_SECOND = 100.0  # Horizontal zoom
-DEFAULT_PIXELS_PER_SEMITONE = 20.0  # Vertical zoom
+DEFAULT_PIXELS_PER_SEMITONE = 12.0  # Vertical zoom (reduced for better default view)
 DEFAULT_MIDI_CENTER = 60  # Middle C as default center
+
+# Zoom limits
+MIN_PIXELS_PER_SECOND = 5.0  # Allow zooming out to see long files
+MAX_PIXELS_PER_SECOND = 2000.0  # Allow detailed zoom in
+MIN_PIXELS_PER_SEMITONE = 2.0  # Allow compressing vertical axis significantly
+MAX_PIXELS_PER_SEMITONE = 100.0  # Maximum vertical zoom
 
 
 class ViewTransform:
@@ -103,9 +109,11 @@ class ViewTransform:
         # Get time at anchor before zoom
         anchor_time = self.x_to_time(anchor_x)
 
-        # Apply zoom
+        # Apply zoom with configurable limits
         self.pixels_per_second *= factor
-        self.pixels_per_second = max(10, min(1000, self.pixels_per_second))
+        self.pixels_per_second = max(
+            MIN_PIXELS_PER_SECOND, min(MAX_PIXELS_PER_SECOND, self.pixels_per_second)
+        )
 
         # Adjust offset to keep anchor time at same X position
         self.x_offset = anchor_time * self.pixels_per_second - anchor_x
@@ -121,9 +129,11 @@ class ViewTransform:
         # Get MIDI at anchor before zoom
         anchor_midi = self.y_to_midi(anchor_y)
 
-        # Apply zoom
+        # Apply zoom with configurable limits
         self.pixels_per_semitone *= factor
-        self.pixels_per_semitone = max(5, min(100, self.pixels_per_semitone))
+        self.pixels_per_semitone = max(
+            MIN_PIXELS_PER_SEMITONE, min(MAX_PIXELS_PER_SEMITONE, self.pixels_per_semitone)
+        )
 
         # Adjust offset to keep anchor MIDI at same Y position
         semitones_from_center = anchor_midi - self.midi_center

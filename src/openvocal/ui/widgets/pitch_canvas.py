@@ -478,7 +478,7 @@ class PitchCanvas(QGraphicsView):
     # Signals
     blob_selected = pyqtSignal(int)  # blob_id
     blob_modified = pyqtSignal(int)  # blob_id
-    view_changed = pyqtSignal(float, float)  # y_offset, pixels_per_semitone
+    view_changed = pyqtSignal(float, float, float)  # y_offset, pixels_per_semitone, midi_center
     status_message = pyqtSignal(str)  # Status bar message
 
     def __init__(self, parent=None):
@@ -751,35 +751,79 @@ class PitchCanvas(QGraphicsView):
     # === Zoom and Pan ===
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Handle mouse wheel for zoom and scroll."""
+        """
+        Handle mouse wheel for zoom and scroll.
+
+        Controls:
+        - Ctrl+Wheel: Horizontal zoom (time axis)
+        - Alt+Wheel or Ctrl+Shift+Wheel: Vertical zoom (pitch axis)
+        - Shift+Wheel: Horizontal scroll (pan through time)
+        - Wheel (no modifier): Vertical scroll (pan through pitch)
+        """
         modifiers = event.modifiers()
         delta = event.angleDelta().y()
+        pos = self.mapToScene(event.position().toPoint())
 
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
-            # Horizontal zoom
-            factor = 1.1 if delta > 0 else 0.9
-            pos = self.mapToScene(event.position().toPoint())
-            self.view_transform.zoom_horizontal(factor, pos.x())
-            self._refresh_all_blobs()
-            self._update_playhead()
-            self.resetCachedContent()
-            self.viewport().update()
+        # Calculate zoom factor based on scroll amount (smoother zoom)
+        zoom_factor = 1.0 + (delta / 1200.0)  # Smaller increments for smoother zoom
+        zoom_factor = max(0.8, min(1.25, zoom_factor))  # Clamp to reasonable range
 
-        elif modifiers & Qt.KeyboardModifier.AltModifier:
-            # Vertical zoom
-            factor = 1.1 if delta > 0 else 0.9
-            pos = self.mapToScene(event.position().toPoint())
-            self.view_transform.zoom_vertical(factor, pos.y())
+        ctrl_held = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        alt_held = bool(modifiers & Qt.KeyboardModifier.AltModifier)
+
+        if ctrl_held and shift_held:
+            # Ctrl+Shift+Wheel: Vertical zoom (alternative to Alt+Wheel)
+            self.view_transform.zoom_vertical(zoom_factor, pos.y())
             self._refresh_all_blobs()
             self.resetCachedContent()
             self.viewport().update()
             self.view_changed.emit(
                 self.view_transform.y_offset,
                 self.view_transform.pixels_per_semitone,
+                self.view_transform.midi_center,
+            )
+            self.status_message.emit(
+                f"Vertical zoom: {self.view_transform.pixels_per_semitone:.1f} px/semitone"
             )
 
+        elif ctrl_held:
+            # Ctrl+Wheel: Horizontal zoom
+            self.view_transform.zoom_horizontal(zoom_factor, pos.x())
+            self._refresh_all_blobs()
+            self._update_playhead()
+            self.resetCachedContent()
+            self.viewport().update()
+            self.status_message.emit(
+                f"Horizontal zoom: {self.view_transform.pixels_per_second:.1f} px/sec"
+            )
+
+        elif alt_held:
+            # Alt+Wheel: Vertical zoom
+            self.view_transform.zoom_vertical(zoom_factor, pos.y())
+            self._refresh_all_blobs()
+            self.resetCachedContent()
+            self.viewport().update()
+            self.view_changed.emit(
+                self.view_transform.y_offset,
+                self.view_transform.pixels_per_semitone,
+                self.view_transform.midi_center,
+            )
+            self.status_message.emit(
+                f"Vertical zoom: {self.view_transform.pixels_per_semitone:.1f} px/semitone"
+            )
+
+        elif shift_held:
+            # Shift+Wheel: Horizontal scroll
+            scroll_amount = -delta / 2
+            self.view_transform.scroll(scroll_amount, 0)
+            self._refresh_all_blobs()
+            self._update_playhead()
+            self.resetCachedContent()
+            self.viewport().update()
+
         else:
-            # Vertical scroll
+            # Plain wheel: Vertical scroll
             scroll_amount = -delta / 4
             self.view_transform.scroll(0, scroll_amount)
             self._refresh_all_blobs()
@@ -788,6 +832,7 @@ class PitchCanvas(QGraphicsView):
             self.view_changed.emit(
                 self.view_transform.y_offset,
                 self.view_transform.pixels_per_semitone,
+                self.view_transform.midi_center,
             )
 
     def zoom_in(self) -> None:
@@ -808,27 +853,183 @@ class PitchCanvas(QGraphicsView):
         self.resetCachedContent()
         self.viewport().update()
 
-    def zoom_fit(self) -> None:
-        """Fit view to show all content."""
-        if not self.project or not self.project.has_audio:
+    def zoom_vertical_in(self) -> None:
+        """Zoom in vertically (expand pitch axis)."""
+        center = self.mapToScene(self.viewport().rect().center())
+        self.view_transform.zoom_vertical(1.2, center.y())
+        self._refresh_all_blobs()
+        self.resetCachedContent()
+        self.viewport().update()
+        self.view_changed.emit(
+            self.view_transform.y_offset,
+            self.view_transform.pixels_per_semitone,
+            self.view_transform.midi_center,
+        )
+
+    def zoom_vertical_out(self) -> None:
+        """Zoom out vertically (compress pitch axis)."""
+        center = self.mapToScene(self.viewport().rect().center())
+        self.view_transform.zoom_vertical(0.8, center.y())
+        self._refresh_all_blobs()
+        self.resetCachedContent()
+        self.viewport().update()
+        self.view_changed.emit(
+            self.view_transform.y_offset,
+            self.view_transform.pixels_per_semitone,
+            self.view_transform.midi_center,
+        )
+
+    def zoom_to_selection(self) -> None:
+        """Zoom to fit selected blobs, or all blobs if none selected."""
+        if not self.project:
             return
 
-        # Calculate pixels per second to fit duration
-        duration = self.project.duration
-        if duration > 0:
-            self.view_transform.pixels_per_second = (
-                self.viewport().width() * 0.9 / duration
-            )
-            self.view_transform.x_offset = 0
+        selected = self.project.get_selected_blobs()
+        blobs_to_fit = selected if selected else self.project.blobs
 
-        # Fit vertical to show vocal range
-        self.view_transform.midi_center = 60  # Middle C
-        self.view_transform.pixels_per_semitone = self.viewport().height() / 36
+        if not blobs_to_fit:
+            return
+
+        # Calculate time and pitch bounds
+        min_time = float('inf')
+        max_time = 0.0
+        min_midi = 127.0
+        max_midi = 0.0
+
+        for blob in blobs_to_fit:
+            min_time = min(min_time, blob.start_time)
+            max_time = max(max_time, blob.end_time)
+
+            if len(blob.original_f0) > 0:
+                voiced_f0 = blob.original_f0[blob.original_f0 > 0]
+                if len(voiced_f0) > 0:
+                    blob_min = NoteBlob.hz_to_midi(np.min(voiced_f0))
+                    blob_max = NoteBlob.hz_to_midi(np.max(voiced_f0))
+                    min_midi = min(min_midi, blob_min)
+                    max_midi = max(max_midi, blob_max)
+
+        if min_time >= max_time or min_midi >= max_midi:
+            return
+
+        # Add padding
+        time_padding = (max_time - min_time) * 0.05
+        min_time = max(0, min_time - time_padding)
+        max_time += time_padding
+        min_midi -= 2
+        max_midi += 2
+
+        viewport_width = self.viewport().width()
+        viewport_height = self.viewport().height()
+
+        # Set horizontal zoom and scroll
+        duration = max_time - min_time
+        if duration > 0:
+            self.view_transform.pixels_per_second = (viewport_width * 0.9) / duration
+            self.view_transform.x_offset = min_time * self.view_transform.pixels_per_second
+
+        # Set vertical zoom and center
+        pitch_range = max_midi - min_midi
+        if pitch_range > 0:
+            self.view_transform.pixels_per_semitone = (viewport_height * 0.9) / pitch_range
+            self.view_transform.midi_center = (min_midi + max_midi) / 2.0
+            self.view_transform.y_offset = 0
+
+        # Clamp to limits
+        from openvocal.utils.coordinates import (
+            MIN_PIXELS_PER_SECOND,
+            MAX_PIXELS_PER_SECOND,
+            MIN_PIXELS_PER_SEMITONE,
+            MAX_PIXELS_PER_SEMITONE,
+        )
+        self.view_transform.pixels_per_second = max(
+            MIN_PIXELS_PER_SECOND,
+            min(MAX_PIXELS_PER_SECOND, self.view_transform.pixels_per_second)
+        )
+        self.view_transform.pixels_per_semitone = max(
+            MIN_PIXELS_PER_SEMITONE,
+            min(MAX_PIXELS_PER_SEMITONE, self.view_transform.pixels_per_semitone)
+        )
 
         self._refresh_all_blobs()
         self._update_playhead()
         self.resetCachedContent()
         self.viewport().update()
+        self.view_changed.emit(
+            self.view_transform.y_offset,
+            self.view_transform.pixels_per_semitone,
+            self.view_transform.midi_center,
+        )
+
+    def zoom_fit(self) -> None:
+        """Fit view to show all content with proper pitch range calculation."""
+        if not self.project or not self.project.has_audio:
+            return
+
+        # Calculate pixels per second to fit duration
+        duration = self.project.duration
+        viewport_width = self.viewport().width()
+        viewport_height = self.viewport().height()
+
+        if duration > 0:
+            self.view_transform.pixels_per_second = (viewport_width * 0.95) / duration
+            self.view_transform.x_offset = 0
+
+        # Calculate actual pitch range from blobs
+        min_midi = 127.0
+        max_midi = 0.0
+
+        if self.project.blobs:
+            for blob in self.project.blobs:
+                if len(blob.original_f0) > 0:
+                    voiced_f0 = blob.original_f0[blob.original_f0 > 0]
+                    if len(voiced_f0) > 0:
+                        blob_min = NoteBlob.hz_to_midi(np.min(voiced_f0))
+                        blob_max = NoteBlob.hz_to_midi(np.max(voiced_f0))
+                        min_midi = min(min_midi, blob_min)
+                        max_midi = max(max_midi, blob_max)
+
+        # If no valid pitch data, use default vocal range
+        if min_midi > max_midi:
+            min_midi = 48.0  # C3
+            max_midi = 72.0  # C5
+
+        # Add padding (2 semitones on each side)
+        min_midi -= 2
+        max_midi += 2
+
+        # Calculate center and pixels per semitone to fit range
+        pitch_range = max_midi - min_midi
+        self.view_transform.midi_center = (min_midi + max_midi) / 2.0
+
+        # Calculate pixels_per_semitone to fit the range in 90% of viewport height
+        if pitch_range > 0:
+            self.view_transform.pixels_per_semitone = (viewport_height * 0.9) / pitch_range
+        else:
+            self.view_transform.pixels_per_semitone = 12.0
+
+        # Clamp to reasonable limits
+        from openvocal.utils.coordinates import (
+            MIN_PIXELS_PER_SEMITONE,
+            MAX_PIXELS_PER_SEMITONE,
+        )
+        self.view_transform.pixels_per_semitone = max(
+            MIN_PIXELS_PER_SEMITONE,
+            min(MAX_PIXELS_PER_SEMITONE, self.view_transform.pixels_per_semitone)
+        )
+
+        self.view_transform.y_offset = 0
+
+        self._refresh_all_blobs()
+        self._update_playhead()
+        self.resetCachedContent()
+        self.viewport().update()
+
+        # Notify piano roll of the change
+        self.view_changed.emit(
+            self.view_transform.y_offset,
+            self.view_transform.pixels_per_semitone,
+            self.view_transform.midi_center,
+        )
 
     # === Mouse Events ===
 
@@ -1019,6 +1220,28 @@ class PitchCanvas(QGraphicsView):
                 self.set_snap_mode(SnapMode.SCALE)
             else:
                 self.set_snap_mode(SnapMode.OFF)
+
+        # Zoom shortcuts
+        elif key == Qt.Key.Key_Plus or key == Qt.Key.Key_Equal:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.zoom_vertical_in()
+            else:
+                self.zoom_in()
+        elif key == Qt.Key.Key_Minus:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.zoom_vertical_out()
+            else:
+                self.zoom_out()
+        elif key == Qt.Key.Key_Home:
+            # Zoom to fit all content
+            self.zoom_fit()
+        elif key == Qt.Key.Key_F:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                # Ctrl+F: Zoom to selection
+                self.zoom_to_selection()
+            else:
+                # F: Zoom fit all
+                self.zoom_fit()
 
         super().keyPressEvent(event)
 

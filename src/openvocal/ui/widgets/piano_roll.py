@@ -58,10 +58,13 @@ class PianoRoll(QWidget):
         self.setMinimumWidth(60)
         self.setMouseTracking(True)
 
-    def update_view(self, y_offset: float, pixels_per_semitone: float) -> None:
+    def update_view(
+        self, y_offset: float, pixels_per_semitone: float, midi_center: float = 60.0
+    ) -> None:
         """Sync view with pitch canvas."""
         self.view_transform.y_offset = y_offset
         self.view_transform.pixels_per_semitone = pixels_per_semitone
+        self.view_transform.midi_center = midi_center
         self.view_transform.set_canvas_height(self.height())
         self.update()
 
